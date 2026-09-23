@@ -4,6 +4,22 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::path::Path;
 
+fn write_file(path: &Path, content: &str) -> std::io::Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // Do not follow a final symlink between Sandbox::check_write and
+        // open(2). The scoped check rejects links up front; this is the
+        // atomic filesystem backstop for a link swap in that small window.
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = options.open(path)?;
+    use std::io::Write;
+    file.write_all(content.as_bytes())
+}
+
 pub struct WriteTool;
 
 #[async_trait]
@@ -64,7 +80,7 @@ impl Tool for WriteTool {
                     .map_err(|e| Error::Tool(format!("mkdir {}: {}", parent.display(), e)))?;
             }
         }
-        std::fs::write(p, content).map_err(|e| Error::Tool(format!("write {path}: {e}")))?;
+        write_file(p, content).map_err(|e| Error::Tool(format!("write {path}: {e}")))?;
         Ok(format!("Wrote {} bytes to {}", content.len(), path))
     }
 }
@@ -117,6 +133,38 @@ mod tests {
             .await
             .unwrap();
         assert!(path.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn refuses_a_dangling_final_symlink_before_and_during_open() {
+        let dir = tempdir().unwrap();
+        let outside = dir.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        let path = dir.path().join("output");
+        std::fs::create_dir(&path).unwrap();
+        let link = path.join("artifact.txt");
+        std::os::unix::fs::symlink(outside.join("artifact.txt"), &link).unwrap();
+
+        // The normal tool path rejects the link before opening it.
+        let err = WriteTool
+            .call(json!({
+                "path": link.to_string_lossy(),
+                "content": "must not follow"
+            }))
+            .await
+            .unwrap_err();
+        assert!(format!("{err}").contains("symbolic link"));
+
+        // The filesystem backstop also rejects a final-link swap in the
+        // check/open window, independently of the policy check.
+        let err = write_file(&link, "must not follow").unwrap_err();
+        let message = format!("{err}");
+        assert!(
+            message.contains("symbolic link") || message.contains("Too many levels"),
+            "unexpected error: {message}"
+        );
+        assert!(!outside.join("artifact.txt").exists());
     }
 
     #[tokio::test]
